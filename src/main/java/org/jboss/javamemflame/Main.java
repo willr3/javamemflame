@@ -5,6 +5,13 @@
  */
 package org.jboss.javamemflame;
 
+import jdk.jfr.consumer.RecordedClass;
+import jdk.jfr.consumer.RecordedEvent;
+import jdk.jfr.consumer.RecordedFrame;
+import jdk.jfr.consumer.RecordedMethod;
+import jdk.jfr.consumer.RecordedStackTrace;
+import jdk.jfr.consumer.RecordingFile;
+
 import java.io.BufferedWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,7 +19,6 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
@@ -20,12 +26,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringTokenizer;
-import jdk.jfr.consumer.RecordedClass;
-import jdk.jfr.consumer.RecordedEvent;
-import jdk.jfr.consumer.RecordedFrame;
-import jdk.jfr.consumer.RecordedMethod;
-import jdk.jfr.consumer.RecordedStackTrace;
-import jdk.jfr.consumer.RecordingFile;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Function;
 
 /**
  * Main class that creates the meminfo-pid.txt file
@@ -34,22 +37,24 @@ public class Main
 {
    /**
     * Open a file
+    *
     * @param p The path of the file
     * @return The file
     */
    private static BufferedWriter openFile(Path p) throws Exception
    {
       BufferedWriter bw = Files.newBufferedWriter(p,
-                                                  StandardOpenOption.CREATE,
-                                                  StandardOpenOption.WRITE,
-                                                  StandardOpenOption.TRUNCATE_EXISTING);
+         StandardOpenOption.CREATE,
+         StandardOpenOption.WRITE,
+         StandardOpenOption.TRUNCATE_EXISTING);
       return bw;
    }
 
    /**
     * Append data to a file
+    *
     * @param bw The file
-    * @param s The string
+    * @param s  The string
     */
    private static void append(BufferedWriter bw, String s) throws Exception
    {
@@ -59,6 +64,7 @@ public class Main
 
    /**
     * Close a file
+    *
     * @param bw The file
     */
    private static void closeFile(BufferedWriter bw) throws Exception
@@ -69,6 +75,7 @@ public class Main
 
    /**
     * Translate from byte code name to human readable name
+    *
     * @param input The input
     * @return Human readable
     */
@@ -78,13 +85,13 @@ public class Main
       int i = 0;
 
       StringBuilder sb = new StringBuilder();
-   
+
       while (input.charAt(i) == '[')
       {
          array++;
          i++;
       }
-   
+
       if (input.charAt(i) == 'Z')
       {
          sb.append("boolean");
@@ -130,38 +137,37 @@ public class Main
       {
          sb.append("[]");
       }
-   
+
       return sb.toString();
    }
 
    /**
     * Sort the map by value
+    *
     * @param m The unsorted map
     * @return The sorted map
     */
-   private static Map<String, Long> sortByValue(Map<String, Long> m)
+   private static Map<String, Long> sortByValue(Map<String, LongAdder> m)
    {
-      List<Map.Entry<String, Long>> l = new LinkedList<>(m.entrySet());
-
-      Collections.sort(l, new Comparator<Map.Entry<String, Long>>()
+      List<Map.Entry<String, LongAdder>> l = new LinkedList<>(m.entrySet());
+      Collections.sort(l, new Comparator<Map.Entry<String, LongAdder>>()
       {
-         public int compare(Map.Entry<String, Long> o1, Map.Entry<String, Long> o2)
+         public int compare(Map.Entry<String, LongAdder> o1, Map.Entry<String, LongAdder> o2)
          {
-            return o2.getValue().compareTo(o1.getValue());
+            return Long.compare(o2.getValue().longValue(), o1.getValue().longValue());
          }
       });
-
       Map<String, Long> sorted = new LinkedHashMap<>();
-      for (Map.Entry<String, Long> entry : l)
+      for (Map.Entry<String, LongAdder> entry : l)
       {
-         sorted.put(entry.getKey(), entry.getValue());
+         sorted.put(entry.getKey(), entry.getValue().longValue());
       }
-
       return sorted;
    }
 
    /**
     * main
+    *
     * @parameter args The program arguments
     */
    public static void main(String[] args)
@@ -179,40 +185,18 @@ public class Main
          String file = args[0];
          Path path = Paths.get(file);
          long pid = 0;
-         Set<String> includes = null;
-         Map<String, Long> allocs = new HashMap<>();
-
-         if (file.indexOf("-") != -1 && file.indexOf(".") != -1)
-            pid = Long.valueOf(file.substring(file.indexOf("-") + 1, file.indexOf(".")));
-
-         BufferedWriter writer = openFile(Paths.get("mem-info-" + pid + ".txt"));
-
-         if (args.length > 1)
+         final Set<String> includes = new HashSet<>();
+         final ConcurrentHashMap<String, LongAdder> allocs = new ConcurrentHashMap<>();
+         Function<RecordedEvent, Runnable> makeRunnable = (re) -> () ->
          {
-            includes = new HashSet<>();
-
-            StringTokenizer st = new StringTokenizer(args[1], ",");
-            while (st.hasMoreTokens())
-            {
-               String include = st.nextToken();
-               include = include.replace('.', '/');
-               includes.add(include);
-            }
-         }
-
-         RecordingFile rcf = new RecordingFile​(path);
-
-         while (rcf.hasMoreEvents())
-         {
-            RecordedEvent re = rcf.readEvent();
             String eventName = re.getEventType().getName();
 
             if ("jdk.ObjectAllocationInNewTLAB".equals(eventName) ||
-                "jdk.ObjectAllocationOutsideTLAB".equals(eventName))
+               "jdk.ObjectAllocationOutsideTLAB".equals(eventName))
             {
                if (re.hasField("stackTrace") && re.hasField("objectClass") && re.hasField("allocationSize"))
                {
-                  RecordedStackTrace st = (RecordedStackTrace)re.getValue("stackTrace");
+                  RecordedStackTrace st = (RecordedStackTrace) re.getValue("stackTrace");
 
                   if (st != null)
                   {
@@ -233,42 +217,62 @@ public class Main
                            sb.append(";");
                         }
 
-                        RecordedClass rc = (RecordedClass)re.getValue("objectClass");
+                        RecordedClass rc = (RecordedClass) re.getValue("objectClass");
                         sb.append(translate(rc.getName()));
 
                         String entry = sb.toString();
 
-                        if (includes == null)
+                        if (includes.isEmpty() || includes.stream().filter(include -> entry.contains(include)).findFirst().orElse(null) != null)
                         {
-                           Long alloc = allocs.get(entry);
-                           if (alloc == null)
-                              alloc = Long.valueOf(0);
-
-                           alloc = Long.valueOf(alloc.longValue() + re.getLong("allocationSize"));
-                           allocs.put(entry, alloc);
-                        }
-                        else
-                        {
-                           for (String include : includes)
-                           {
-                              if (entry.contains(include))
-                              {
-                                 Long alloc = allocs.get(entry);
-                                 if (alloc == null)
-                                    alloc = Long.valueOf(0);
-
-                                 alloc = Long.valueOf(alloc.longValue() + re.getLong("allocationSize"));
-                                 allocs.put(entry, alloc);
-                                 break;
-                              }
-                           }
+                           allocs.putIfAbsent(entry, new LongAdder());
+                           allocs.get(entry).add(re.getLong("allocationSize"));
                         }
                      }
                   }
                }
             }
+         };
+
+         if (file.indexOf("-") != -1 && file.indexOf(".") != -1)
+         {
+            pid = Long.valueOf(file.substring(file.indexOf("-") + 1, file.indexOf(".")));
          }
 
+         BufferedWriter writer = openFile(Paths.get("mem-info-" + pid + ".txt"));
+
+         if (args.length > 1)
+         {
+            StringTokenizer st = new StringTokenizer(args[1], ",");
+            while (st.hasMoreTokens())
+            {
+               String include = st.nextToken();
+               include = include.replace('.', '/');
+               includes.add(include);
+            }
+         }
+
+         RecordingFile rcf = new RecordingFile(path);
+         BlockingQueue queue = new ArrayBlockingQueue(2 * Runtime.getRuntime().availableProcessors());
+         ThreadPoolExecutor executor = new ThreadPoolExecutor(
+            Runtime.getRuntime().availableProcessors(),
+            2 * Runtime.getRuntime().availableProcessors(),
+            30, TimeUnit.MINUTES,
+            queue,
+            new ThreadPoolExecutor.CallerRunsPolicy());
+
+         while (rcf.hasMoreEvents())
+         {
+            RecordedEvent re = rcf.readEvent();
+            String eventName = re.getEventType().getName();
+
+            if ("jdk.ObjectAllocationInNewTLAB".equals(eventName) ||
+               "jdk.ObjectAllocationOutsideTLAB".equals(eventName))
+            {
+               executor.submit(makeRunnable.apply(re));
+            }
+         }
+         executor.shutdown();
+         executor.awaitTermination(24, TimeUnit.HOURS);
          for (Map.Entry<String, Long> entry : sortByValue(allocs).entrySet())
          {
             append(writer, entry.getKey() + " " + entry.getValue());
@@ -276,8 +280,7 @@ public class Main
 
          rcf.close();
          closeFile(writer);
-      }
-      catch (Exception e)
+      } catch (Exception e)
       {
          System.err.println(e.getMessage());
          e.printStackTrace();

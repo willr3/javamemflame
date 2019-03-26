@@ -87,8 +87,8 @@ public class Agent
                r.disable(et.getName());
             }
 
-            r.enable​("jdk.ObjectAllocationInNewTLAB");
-            r.enable​("jdk.ObjectAllocationOutsideTLAB");
+            r.enable("jdk.ObjectAllocationInNewTLAB");
+            r.enable("jdk.ObjectAllocationOutsideTLAB");
 
             r.setDestination(path);
             r.setDumpOnExit(true);
